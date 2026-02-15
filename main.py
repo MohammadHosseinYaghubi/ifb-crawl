@@ -1,13 +1,17 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
 import sys
+import re
 import time
 import json
 import pandas as pd
-import re
 from datetime import datetime
-from typing import List, Optional, Dict
+from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, asdict
 import logging
+from urllib.parse import urlparse
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -15,15 +19,16 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
 
+import gspread
+from google.oauth2.service_account import Credentials
 from bs4 import BeautifulSoup
 
-# ================== تنظیم encoding ==================
+# -------------------- تنظیمات اولیه --------------------
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
-# ================== تنظیمات لاگینگ ==================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -35,8 +40,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 IFB_MAIN_URL = "https://www.ifb.ir/Finstars/AllCrowdFundingProject.aspx"
+SHEET_NAME = "Crowdfunding_Projects_1404"
+CREDS_ENV_VAR = "GOOGLE_CREDENTIALS"
 
-
+# -------------------- مدل داده --------------------
 @dataclass
 class IFBProject:
     row_number: str
@@ -50,7 +57,8 @@ class IFBProject:
     description: str
     documents_url: str
     scraped_date: str
-    # فیلدهای اضافی (از سکو)
+    ifb_project_id: Optional[str] = None          # شناسه یکتای فرابورس (از showDesc)
+    # فیلدهای استخراج‌شده از سکو
     target_amount: Optional[str] = None
     collected_amount: Optional[str] = None
     progress_percentage: Optional[str] = None
@@ -72,6 +80,7 @@ class IFBProject:
         return asdict(self)
 
 
+# -------------------- کلاس اصلی اسکرپر فرابورس --------------------
 class IFBScraper:
     def __init__(self, headless: bool = False):
         self.config = {
@@ -118,10 +127,8 @@ class IFBScraper:
         logger.info(f"ChromeDriver راه‌اندازی شد: {chromedriver_path}")
         return driver
 
-    # ========== متدهای کمکی برای پیجینیشن و استخراج از فرابورس ==========
-
+    # ---------- متدهای کمکی برای پیجینیشن و استخراج از فرابورس ----------
     def _navigate_to_page(self, page_number: int) -> bool:
-        """رفتن به صفحه مشخص با استفاده از __doPostBack"""
         try:
             event_target = 'ctl00$ContentPlaceHolder1$grdCrowdFundingData'
             event_argument = f'Page${page_number}'
@@ -142,14 +149,12 @@ class IFBScraper:
             self.driver.execute_script(f"showDesc('{desc_id}');")
             time.sleep(2)
 
-            # روش ۱: JavaScript
             desc_script = """
                 var el = document.getElementById('Message');
                 return el ? el.innerText || el.textContent : '';
             """
             description = self.driver.execute_script(desc_script)
             if description:
-                # بستن modal با JS خالص
                 self.driver.execute_script("""
                     var modal = document.getElementById('FileForm');
                     if (modal) {
@@ -162,12 +167,10 @@ class IFBScraper:
                 """)
                 return description.strip()
 
-            # روش ۲: BeautifulSoup
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
             msg = soup.find('small', {'id': 'Message'}) or soup.find('div', {'id': 'Message'})
             if msg:
                 description = msg.get_text(strip=True)
-                # بستن modal
                 self.driver.execute_script("""
                     var modal = document.getElementById('FileForm');
                     if (modal) {
@@ -186,7 +189,6 @@ class IFBScraper:
             return "خطا در دریافت توضیحات"
 
     def _extract_current_page_projects(self) -> List[IFBProject]:
-        """استخراج پروژه‌های صفحه جاری از جدول فرابورس"""
         projects = []
         soup = BeautifulSoup(self.driver.page_source, 'html.parser')
         table = soup.find('table', {'id': 'ContentPlaceHolder1_grdCrowdFundingData'})
@@ -203,34 +205,36 @@ class IFBScraper:
                     project_name = cells[1].text.strip()
                     company_name = cells[2].text.strip()
                     national_id = cells[3].text.strip()
-
                     platform_link = cells[4].find('a')
                     platform_url = platform_link['href'] if platform_link else ""
-
                     status = cells[5].text.strip()
                     start_date = cells[6].text.strip()
                     end_date = cells[7].text.strip()
 
-                    # استخراج توضیحات
+                    # استخراج توضیحات و شناسه یکتا
+                    ifb_id = None
                     description = "توضیحات در دسترس نیست"
                     details_link = cells[8].find('a')
                     if details_link and 'onclick' in details_link.attrs:
                         onclick = details_link['onclick']
                         match = re.search(r"showDesc\('(\d+)'\)", onclick)
                         if match:
-                            desc_id = match.group(1)
-                            description = self._extract_description_from_modal(desc_id)
+                            ifb_id = match.group(1)
+                            description = self._extract_description_from_modal(ifb_id)
 
-                    # لینک مدارک
+                    # اگر از لینک توضیحات id گرفته نشد، از لینک مدارک بگیر
+                    if not ifb_id:
+                        documents_cell = cells[9]
+                        documents_link = documents_cell.find('i', {'class': 'icon-folder'})
+                        if documents_link and 'onclick' in documents_link.attrs:
+                            onclick = documents_link['onclick']
+                            match = re.search(r"GoToDocuments\('(\d+)'\)", onclick)
+                            if match:
+                                ifb_id = match.group(1)
+
                     documents_url = ""
-                    documents_cell = cells[9]
-                    documents_link = documents_cell.find('i', {'class': 'icon-folder'})
-                    if documents_link and 'onclick' in documents_link.attrs:
-                        onclick = documents_link['onclick']
-                        match = re.search(r"GoToDocuments\('(\d+)'\)", onclick)
-                        if match:
-                            doc_id = match.group(1)
-                            documents_url = f"{IFB_MAIN_URL}?doc_id={doc_id}"
+                    if ifb_id:  # ساخت documents_url با همان id
+                        documents_url = f"{IFB_MAIN_URL}?doc_id={ifb_id}"
 
                     project = IFBProject(
                         row_number=row_number,
@@ -243,16 +247,16 @@ class IFBScraper:
                         project_end_date=end_date,
                         description=description,
                         documents_url=documents_url,
-                        scraped_date=datetime.now().strftime('%Y/%m/%d %H:%M:%S')
+                        scraped_date=datetime.now().strftime('%Y/%m/%d %H:%M:%S'),
+                        ifb_project_id=ifb_id
                     )
                     projects.append(project)
-                    logger.info(f"ردیف {row_number}: {project_name} - تاریخ شروع {start_date}")
+                    logger.info(f"ردیف {row_number}: {project_name} - شناسه {ifb_id}")
                 except Exception as e:
                     logger.error(f"خطا در پردازش یک ردیف: {e}")
         return projects
 
     def scrape_all_pages(self) -> List[IFBProject]:
-        """پیمایش صفحات فرابورس تا مواجهه با تاریخ غیر ۱۴۰۴"""
         all_projects = []
         page_num = 1
         stop_pagination = False
@@ -299,44 +303,54 @@ class IFBScraper:
         logger.info(f"🎯 پایان: {len(all_projects)} پروژه ۱۴۰۴")
         return all_projects
 
-    # ========== متدهای استخراج جزئیات از سکوها ==========
+    def close(self):
+        if self.driver:
+            self.driver.quit()
+            logger.info("مرورگر بسته شد")
 
-    def enrich_projects_with_platform_details(self, projects: List[IFBProject]) -> List[Dict]:
-        enriched = []
-        total = len(projects)
-        for idx, project in enumerate(projects, 1):
-            logger.info(f"\n[{idx}/{total}] پردازش پروژه: {project.project_name}")
-            combined = project.to_dict()
-            try:
-                details = self._scrape_single_platform(project)
-                combined.update(details)
-                logger.info(f"   ✅ {len(details)} فیلد جدید استخراج شد.")
-            except Exception as e:
-                logger.error(f"   ❌ خطا: {e}")
-            enriched.append(combined)
-            time.sleep(self.config['delay'])
-        return enriched
 
-    def _scrape_single_platform(self, project: IFBProject) -> Dict:
-        url = project.platform_url
-        if not url:
+# -------------------- کلاس استخراج اطلاعات از سکوها --------------------
+class PlatformDetailScraper:
+    """
+    این کلاس وظیفه دارد برای یک پروژه IFB به آدرس سکو رفته و اطلاعات کارت را استخراج کند.
+    تشخیص دامنه و انتخاب روش مناسب در این کلاس انجام می‌شود.
+    """
+    def __init__(self, driver: webdriver.Chrome, config: dict):
+        self.driver = driver
+        self.config = config
+        self.wait = WebDriverWait(self.driver, config['timeout'])
+
+    def scrape(self, project: IFBProject) -> Dict[str, Any]:
+        if not project.platform_url:
             return {}
-        domain = url.lower()
+
+        domain = urlparse(project.platform_url).netloc.lower()
+        logger.info(f"🔍 شروع استخراج از {domain} برای پروژه {project.project_name}")
+
+        # انتخاب متد بر اساس دامنه
         if 'hamafarin.ir' in domain:
             return self._scrape_hamafarin(project)
         elif 'fundocrowd.ir' in domain:
             return self._scrape_fundocrowd(project)
         elif 'karencrowd.com' in domain:
             return self._scrape_karencrowd(project)
+        elif 'ifund.ir' in domain:
+            return self._scrape_ifund(project)
+        elif 'zeema.fund' in domain:
+            return self._scrape_zeema(project)
         else:
+            # متد عمومی برای سایر سکوها
             return self._scrape_generic(project)
 
-    # ---------- هم‌آفرین ----------
+    # ---------- متدهای اختصاصی برای هر سکو ----------
     def _scrape_hamafarin(self, project: IFBProject) -> Dict:
+        """هم‌آفرین – ساختار کارت‌های گروهی"""
         details = {}
         try:
             self.driver.get(project.platform_url)
             time.sleep(self.config['delay'])
+
+            # اگر به صفحه اصلی رفت، به لیست طرح‌ها برو
             if "businessplans" not in self.driver.current_url:
                 try:
                     view_all = self.driver.find_element(By.CSS_SELECTOR, "a[href='/businessplans']")
@@ -365,31 +379,40 @@ class IFBScraper:
 
     def _extract_hamafarin_card(self, card) -> Dict:
         d = {}
+        # عنوان
         title = card.find('a', class_=lambda c: c and 'text-[#2E2300]' in c)
         if title:
             d['title_on_platform'] = title.text.strip()
+        # لینک و شناسه
         link = card.find('a', href=re.compile(r'/businessplans/\d+'))
         if link and 'href' in link.attrs:
             match = re.search(r'/businessplans/(\d+)', link['href'])
             if match:
                 d['project_id_on_platform'] = match.group(1)
+        # تصویر
         img = card.find('img')
         if img and img.get('src'):
             d['thumbnail_url'] = img['src']
+        # نهاد مالی
         fin = card.find('p', string=re.compile('نهاد مالی:'))
         if fin:
             d['financial_institution'] = fin.text.strip()
+        # مجری
         exec_p = card.find('p', class_='text-black17 font-YekanBakh text-md')
         if exec_p:
             d['applicant_name'] = exec_p.text.strip()
+        # بخش پایینی
         bottom = card.find('div', class_=lambda c: c and 'bg-white' in c and '!pb-12' in c)
         if bottom:
+            # وضعیت
             status_p = bottom.find('p', class_=lambda c: c and ('text-green67' in c or 'text-primary' in c))
             if status_p:
                 d['status_on_platform'] = status_p.text.strip()
+            # درصد
             perc = bottom.find('p', class_=lambda c: c and 'text-black17/70' in c)
             if perc and '%' in perc.text:
                 d['progress_percentage'] = perc.text.strip()
+            # گرید اطلاعات
             grid = bottom.find('div', class_=lambda c: c and 'grid-cols-3' in c)
             if grid:
                 for item in grid.find_all('div', class_=lambda c: c and 'flex flex-col items-center gap-y-1' in c):
@@ -418,8 +441,8 @@ class IFBScraper:
                             d['profit_payment_frequency'] = val
         return d
 
-    # ---------- فاندوکراد ----------
     def _scrape_fundocrowd(self, project: IFBProject) -> Dict:
+        """فاندوکراد – ساختار home-box-design"""
         details = {}
         try:
             self.driver.get(project.platform_url)
@@ -436,6 +459,7 @@ class IFBScraper:
                 card_title = title_elem.text.strip()
                 if target in card_title or card_title in target:
                     details = self._extract_fundocrowd_card(card)
+                    # اگر برخی فیلدها ناقص بود، روی دکمه جزئیات کلیک کن
                     if not details.get('expected_return') or not details.get('project_duration'):
                         details.update(self._scrape_fundocrowd_details(card))
                     break
@@ -504,12 +528,13 @@ class IFBScraper:
             logger.error(f"خطا در صفحه جزئیات فاندوکراد: {e}")
         return d
 
-    # ---------- کارن‌کراد ----------
     def _scrape_karencrowd(self, project: IFBProject) -> Dict:
+        """کارن‌کراد – مشابه کد قبلی"""
         details = {}
         try:
             self.driver.get(project.platform_url)
             time.sleep(self.config['delay'])
+
             if "plans" not in self.driver.current_url:
                 try:
                     view_all = self.driver.find_element(By.XPATH, "//a[contains(text(), 'مشاهده همه طرح‌ها')]")
@@ -570,14 +595,168 @@ class IFBScraper:
                             d['expected_return'] = val
         return d
 
-    # ---------- متد عمومی ----------
+    def _scrape_ifund(self, project: IFBProject) -> Dict:
+        """آی‌فاند – ساختار آی‌فاند"""
+        details = {}
+        try:
+            self.driver.get(project.platform_url)
+            time.sleep(self.config['delay'])
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            # جستجوی کارت‌ها با کلاس‌های متداول
+            cards = soup.find_all('div', class_=lambda c: c and 'col-span-1' in c and 'bg-white' in c)
+            target = project.project_name.strip()
+            for card in cards:
+                title_elem = card.find('p', class_='text-lg lg:text-xl font-medium')
+                if not title_elem:
+                    continue
+                card_title = title_elem.text.strip()
+                if target in card_title or card_title in target:
+                    details = self._extract_ifund_card(card)
+                    break
+        except Exception as e:
+            logger.error(f"خطا در آی‌فاند: {e}")
+        return details
+
+    def _extract_ifund_card(self, card) -> Dict:
+        d = {}
+        try:
+            # عنوان
+            title = card.find('p', class_='text-lg lg:text-xl font-medium')
+            if title:
+                d['title_on_platform'] = title.text.strip()
+            # سود پیش‌بینی
+            profit_span = card.find('span', class_='bg-custom-orange')
+            if profit_span:
+                d['expected_return'] = profit_span.text.strip()
+            # نماد
+            symbol_a = card.find('a', string=re.compile(r'فاندویرا'))
+            if symbol_a:
+                d['project_symbol'] = symbol_a.text.strip()
+            # مبلغ هدف و جمع‌آوری شده
+            divs = card.find_all('div', class_='flex justify-between text-base font-medium')
+            if len(divs) >= 1:
+                spans = divs[0].find_all('span')
+                if len(spans) >= 2:
+                    d['collected_amount'] = spans[0].text.strip()
+                    d['target_amount'] = spans[1].text.strip()
+            # نهاد مالی، متقاضی، مدت، نوع، تضمین از لیست
+            items = card.find_all('div', class_='flex items-center justify-start text-black')
+            for it in items:
+                text = it.get_text(" ", strip=True)
+                if 'سکوی تامین مالی جمعی آیفاند' in text:
+                    d['platform_name'] = 'آی‌فاند'
+                elif 'نام متقاضی :' in text:
+                    d['applicant_name'] = text.replace('نام متقاضی :', '').strip()
+                elif 'نهاد مالی :' in text:
+                    d['financial_institution'] = text.replace('نهاد مالی :', '').strip()
+                elif 'مدت طرح :' in text:
+                    d['project_duration'] = text.replace('مدت طرح :', '').strip()
+                elif 'نماد طرح :' in text:
+                    d['project_symbol'] = text.replace('نماد طرح :', '').strip()
+                elif 'نوع تامین مالی :' in text:
+                    d['project_type'] = text.replace('نوع تامین مالی :', '').strip()
+                elif 'سود پیش بینی شده سالانه:' in text:
+                    # قبلاً از profit_span گرفتیم
+                    pass
+                elif 'مواعد پرداخت سود پیش بینی شده :' in text:
+                    d['profit_payment_frequency'] = text.replace('مواعد پرداخت سود پیش بینی شده :', '').strip()
+                elif 'بدون تضمین سود' in text:
+                    d['capital_guarantee'] = text
+        except Exception as e:
+            logger.warning(f"خطا در استخراج آی‌فاند: {e}")
+        return d
+
+    def _scrape_zeema(self, project: IFBProject) -> Dict:
+        """زیمه – ساختار Material-UI"""
+        details = {}
+        try:
+            self.driver.get(project.platform_url)
+            time.sleep(self.config['delay'])
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            cards = soup.find_all('div', class_=lambda c: c and 'MuiGrid-root' in c)
+            target = project.project_name.strip()
+            for card in cards:
+                # عنوان در <span class="MuiTypography-root MuiTypography-subtitleBold">
+                title_span = card.find('span', class_='MuiTypography-subtitleBold')
+                if title_span and target in title_span.text:
+                    details = self._extract_zeema_card(card)
+                    break
+        except Exception as e:
+            logger.error(f"خطا در زیمه: {e}")
+        return details
+
+    def _extract_zeema_card(self, card) -> Dict:
+        d = {}
+        try:
+            # عنوان
+            title = card.find('span', class_='MuiTypography-subtitleBold')
+            if title:
+                d['title_on_platform'] = title.text.strip()
+            # تصویر
+            img = card.find('img')
+            if img and img.get('src'):
+                d['thumbnail_url'] = img['src']
+            # شرکت/متقاضی
+            company = card.find('span', class_='MuiTypography-smallMedium')
+            if company:
+                d['applicant_name'] = company.text.strip()
+            # سرمایه مورد نیاز و پیش‌بینی سود
+            req_divs = card.find_all('div', class_='MuiStack-root muirtl-bu0fgp')
+            for div in req_divs:
+                spans = div.find_all('span')
+                if len(spans) >= 2:
+                    label = spans[0].text.strip()
+                    value = spans[1].text.strip()
+                    if 'سرمایه مورد نیاز' in label:
+                        d['target_amount'] = value
+                    elif 'پیش بینی سود پروژه' in label:
+                        d['expected_return'] = value
+            # مدت طرح
+            duration = card.find('div', class_='MuiStack-root muirtl-bl0m4')
+            if duration:
+                spans = duration.find_all('span')
+                if len(spans) >= 2:
+                    d['project_duration'] = spans[1].text.strip()
+            # نهاد مالی
+            fin = card.find('div', class_='MuiStack-root muirtl-bl0m4', string=re.compile('نام نهاد مالی'))
+            if fin:
+                spans = fin.find_all('span')
+                if len(spans) >= 2:
+                    d['financial_institution'] = spans[1].text.strip()
+            # تضمین
+            guar = card.find('div', class_='MuiStack-root muirtl-14mq6mq')
+            if guar:
+                d['capital_guarantee'] = guar.text.strip()
+            # سرمایه تامین شده
+            collected = card.find('div', class_='MuiStack-root muirtl-1pbtxwi')
+            if collected:
+                spans = collected.find_all('span')
+                if len(spans) >= 2:
+                    d['collected_amount'] = spans[1].text.strip()
+            # درصد پیشرفت
+            progress = card.find('div', class_='MuiLinearProgress-root')
+            if progress and progress.has_attr('aria-valuenow'):
+                d['progress_percentage'] = progress['aria-valuenow']
+            # تعداد سرمایه‌گذاران
+            investors = card.find('div', class_='MuiStack-root muirtl-mk4amx')
+            if investors:
+                spans = investors.find_all('span')
+                if len(spans) >= 2:
+                    d['investor_count'] = spans[1].text.strip()
+        except Exception as e:
+            logger.warning(f"خطا در استخراج زیمه: {e}")
+        return d
+
+    # ---------- متد عمومی (fallback) ----------
     def _scrape_generic(self, project: IFBProject) -> Dict:
+        """تلاش برای استخراج با الگوهای عمومی (عنوان، مبلغ، سود، ...)"""
         d = {}
         try:
             self.driver.get(project.platform_url)
             time.sleep(self.config['delay'])
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
             page_text = soup.get_text()
+            # الگوهای رایج
             patterns = {
                 'target_amount': [r'مبلغ هدف.*?([\d,٬]+)', r'هدف.*?([\d,٬]+)\s*تومان', r'سرمایه مورد نیاز.*?([\d,٬]+)'],
                 'expected_return': [r'(\d+\.?\d*)\s*٪', r'سود پیش‌بینی.*?(\d+\.?\d*)', r'بازده.*?(\d+\.?\d*)'],
@@ -590,12 +769,15 @@ class IFBScraper:
                     if match:
                         d[field] = match.group(1)
                         break
+            # نام شرکت/متقاضی
             company_patterns = [r'شرکت\s*([\w\s]+)', r'متقاضی\s*:\s*([\w\s]+)']
             for pat in company_patterns:
                 match = re.search(pat, page_text)
                 if match:
                     d['applicant_name'] = match.group(1).strip()
                     break
+            # نام سکو (از دامنه)
+            d['platform_name'] = urlparse(project.platform_url).netloc
         except Exception as e:
             logger.error(f"خطا در متد عمومی: {e}")
         return d
@@ -605,58 +787,169 @@ class IFBScraper:
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(1)
 
-    # ========== ذخیره‌سازی ==========
-    def save_combined_data(self, data: List[Dict], base_name: str = "ifb_projects_1404_with_details"):
-        json_file = f"{base_name}.json"
-        csv_file = f"{base_name}.csv"
-        with open(json_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
-        logger.info(f"فایل JSON ذخیره شد: {json_file}")
 
-        df = pd.DataFrame(data)
-        df.to_csv(csv_file, index=False, encoding='utf-8-sig')
-        logger.info(f"فایل CSV ذخیره شد: {csv_file}")
+# -------------------- کلاس مدیریت Google Sheets (افزایشی) --------------------
+class GoogleSheetsHandler:
+    def __init__(self, credentials_dict: dict = None, credentials_path: str = 'service_account.json'):
+        self.credentials_dict = credentials_dict
+        self.credentials_path = credentials_path
+        self.client = self._authenticate()
 
-    def close(self):
-        if self.driver:
-            self.driver.quit()
-            logger.info("مرورگر بسته شد")
+    def _authenticate(self):
+        try:
+            scopes = ['https://www.googleapis.com/auth/spreadsheets',
+                      'https://www.googleapis.com/auth/drive']
+            if self.credentials_dict:
+                credentials = Credentials.from_service_account_info(self.credentials_dict, scopes=scopes)
+            else:
+                if not os.path.exists(self.credentials_path):
+                    logger.warning(f"فایل {self.credentials_path} یافت نشد.")
+                    return None
+                credentials = Credentials.from_service_account_file(self.credentials_path, scopes=scopes)
+            return gspread.authorize(credentials)
+        except Exception as e:
+            logger.error(f"خطا در احراز هویت Google Sheets: {str(e)}")
+            return None
+
+    def get_existing_ids(self, sheet_name: str, worksheet_index: int = 0) -> set:
+        if not self.client:
+            return set()
+        try:
+            spreadsheet = self.client.open(sheet_name)
+            worksheet = spreadsheet.get_worksheet(worksheet_index)
+            if not worksheet:
+                return set()
+            headers = worksheet.row_values(1)
+            try:
+                col_index = headers.index('ifb_project_id') + 1
+            except ValueError:
+                logger.warning("ستون 'ifb_project_id' در شیت یافت نشد.")
+                return set()
+            ids = worksheet.col_values(col_index)[1:]
+            return set(ids)
+        except gspread.SpreadsheetNotFound:
+            logger.info(f"شیت {sheet_name} وجود ندارد.")
+            return set()
+        except Exception as e:
+            logger.error(f"خطا در خواندن شناسه‌های موجود: {e}")
+            return set()
+
+    def append_new_rows(self, sheet_name: str, data: List[Dict], id_field: str = 'ifb_project_id'):
+        if not self.client:
+            logger.error("Google Sheets client not available.")
+            return False
+
+        try:
+            spreadsheet = self.client.open(sheet_name)
+            worksheet = spreadsheet.sheet1
+        except gspread.SpreadsheetNotFound:
+            logger.info(f"شیت {sheet_name} یافت نشد. در حال ایجاد...")
+            spreadsheet = self.client.create(sheet_name)
+            worksheet = spreadsheet.sheet1
+            if data:
+                headers = list(data[0].keys())
+                worksheet.append_row(headers)
+                logger.info("هدر ایجاد شد.")
+
+        existing_ids = self.get_existing_ids(sheet_name)
+        logger.info(f"تعداد شناسه‌های موجود در شیت: {len(existing_ids)}")
+
+        new_rows = []
+        for item in data:
+            pid = str(item.get(id_field, ''))
+            if pid and pid not in existing_ids:
+                new_rows.append(list(item.values()))
+            elif not pid:
+                logger.warning(f"ردیف بدون شناسه: {item.get('project_name', '')} - اضافه نمی‌شود.")
+
+        if new_rows:
+            worksheet.append_rows(new_rows)
+            logger.info(f"تعداد {len(new_rows)} ردیف جدید به شیت اضافه شد.")
+        else:
+            logger.info("هیچ ردیف جدیدی برای اضافه کردن وجود ندارد.")
+
+        logger.info(f"لینک شیت: https://docs.google.com/spreadsheets/d/{spreadsheet.id}")
+        return True
 
 
+# -------------------- تابع اصلی --------------------
 def main():
     logger.info("=" * 60)
     logger.info("شروع استخراج طرح‌های تامین مالی جمعی از فرابورس ایران")
     logger.info(f"آدرس: {IFB_MAIN_URL}")
     logger.info("=" * 60)
 
-    scraper = IFBScraper(headless=False)
+    # خواندن credentials از متغیر محیطی (برای GitHub Actions)
+    creds_json = os.environ.get(CREDS_ENV_VAR)
+    sheets_handler = None
+    if creds_json:
+        try:
+            creds_dict = json.loads(creds_json)
+            sheets_handler = GoogleSheetsHandler(credentials_dict=creds_dict)
+            logger.info("✅ اعتبارنامه Google Sheets از متغیر محیطی خوانده شد.")
+        except Exception as e:
+            logger.error(f"❌ خطا در پارس کردن GOOGLE_CREDENTIALS: {e}")
+    else:
+        # fallback به فایل محلی (برای تست محلی)
+        sheets_handler = GoogleSheetsHandler(credentials_path='service_account.json')
+        logger.info("📁 از فایل محلی service_account.json استفاده می‌شود.")
+
+    scraper = IFBScraper(headless=False)  # در GitHub Actions headless=True می‌گذاریم
     try:
+        # مرحله 1: استخراج پروژه‌های ۱۴۰۴ از فرابورس
         projects = scraper.scrape_all_pages()
         if not projects:
-            logger.warning("هیچ پروژه‌ای با تاریخ شروع ۱۴۰۴ یافت نشد.")
+            logger.warning("⚠️ هیچ پروژه‌ای با تاریخ شروع ۱۴۰۴ یافت نشد.")
             return
 
-        logger.info(f"تعداد {len(projects)} پروژه با تاریخ شروع ۱۴۰۴ استخراج شد.")
+        logger.info(f"📦 تعداد {len(projects)} پروژه با تاریخ شروع ۱۴۰۴ استخراج شد.")
 
+        # مرحله 2: استخراج جزئیات از سکوها
         logger.info("\n" + "=" * 60)
         logger.info("مرحله 2: استخراج جزئیات از سکوها")
         logger.info("=" * 60)
-        enriched = scraper.enrich_projects_with_platform_details(projects)
 
-        scraper.save_combined_data(enriched, "ifb_projects_1404_complete")
+        # برای هر پروژه یک شیء PlatformDetailScraper ایجاد می‌کنیم (با همان driver)
+        detail_scraper = PlatformDetailScraper(scraper.driver, scraper.config)
+        enriched_projects = []
+        for idx, proj in enumerate(projects, 1):
+            logger.info(f"\n[{idx}/{len(projects)}] پردازش پروژه: {proj.project_name}")
+            details = detail_scraper.scrape(proj)
+            # ترکیب اطلاعات
+            combined = proj.to_dict()
+            combined.update(details)
+            enriched_projects.append(combined)
+            logger.info(f"   ✅ {len(details)} فیلد جدید استخراج شد.")
+            time.sleep(scraper.config['delay'])
+
+        # مرحله 3: ذخیره محلی (JSON و CSV)
+        base_filename = "ifb_projects_1404_complete"
+        with open(f"{base_filename}.json", 'w', encoding='utf-8') as f:
+            json.dump(enriched_projects, f, ensure_ascii=False, indent=4)
+        logger.info(f"💾 فایل JSON ذخیره شد: {base_filename}.json")
+
+        df = pd.DataFrame(enriched_projects)
+        df.to_csv(f"{base_filename}.csv", index=False, encoding='utf-8-sig')
+        logger.info(f"💾 فایل CSV ذخیره شد: {base_filename}.csv")
+
+        # مرحله 4: اضافه کردن افزایشی به Google Sheets
+        if sheets_handler and sheets_handler.client:
+            sheets_handler.append_new_rows(SHEET_NAME, enriched_projects, id_field='ifb_project_id')
+        else:
+            logger.warning("⚠️ Google Sheets در دسترس نیست.")
 
         # نمایش نمونه
-        logger.info("\n📊 نمونه داده‌های ترکیبی:")
-        for i, item in enumerate(enriched[:3]):
+        logger.info("\n📊 نمونه داده‌های ترکیبی (۳ پروژه اول):")
+        for i, item in enumerate(enriched_projects[:3]):
             logger.info(f"\nپروژه {i+1}: {item.get('project_name')}")
+            logger.info(f"   شناسه فرابورس: {item.get('ifb_project_id', '---')}")
             logger.info(f"   مبلغ هدف: {item.get('target_amount', '---')}")
             logger.info(f"   مدت طرح: {item.get('project_duration', '---')}")
             logger.info(f"   سود پیش‌بینی: {item.get('expected_return', '---')}")
             logger.info(f"   متقاضی: {item.get('applicant_name', '---')}")
-            logger.info(f"   تاریخ شروع در سکو: {item.get('start_date_on_platform', '---')}")
 
     except Exception as e:
-        logger.error(f"خطای کلی: {e}")
+        logger.error(f"❌ خطای کلی: {e}")
         import traceback
         logger.error(traceback.format_exc())
     finally:
